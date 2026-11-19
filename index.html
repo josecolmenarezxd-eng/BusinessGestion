@@ -1014,7 +1014,6 @@
         }
 
         // ================= CONFIGURACIÓN DE FIREBASE (NUBE REAL PARA GOOGLE SITES) =================
-        // IMPORTANTE: Reemplaza estos valores con los de tu proyecto gratuito en console.firebase.google.com
         const firebaseConfig = {
             apiKey: "AIzaSyAIBduBuyBc2gUzO7EqN0STn5LGbGNVI_4",
             authDomain: "business-gestion-72d6b.firebaseapp.com",
@@ -1047,13 +1046,8 @@
         }
 
         let activeFirebaseListener = null;
-        let activeUsersListener = null;
         let activeSessionListener = null;
         let globalBusChannel = null;
-
-        function isCloudConnected() {
-            return Boolean(cloudDb && navigator.onLine);
-        }
 
         function updateCloudStatusIndicators() {
             const badge = document.getElementById('sync-status-badge');
@@ -1165,7 +1159,6 @@
             }
         }
 
-        // Canal global entre pestañas para detectar creación de cuentas, cierre de sesión y datos
         function initGlobalPageBus() {
             if (!('BroadcastChannel' in window)) return;
             if (globalBusChannel) globalBusChannel.close();
@@ -1486,7 +1479,10 @@
             }
 
             currentUser = null;
+            products = [];
+            history = [];
             cart = [];
+            productPriceViews = {};
             SafeStorage.remove('gp_active_session');
             if (syncChannel) {
                 syncChannel.close();
@@ -1500,6 +1496,10 @@
                 activeSessionListener.off();
                 activeSessionListener = null;
             }
+            ['inventory-search', 'entry-search', 'exit-search', 'price-adjust-search', 'fiados-search', 'cart-client-name'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.value = '';
+            });
             document.getElementById('app-wrapper').classList.add('hidden');
             document.getElementById('app-wrapper').classList.remove('flex');
             document.getElementById('auth-screen').classList.remove('hidden');
@@ -1531,7 +1531,6 @@
             }
         }
 
-        // Solo notificar cuando el evento sea PRICE_CHANGE, EXIT_FIADO o ENTRY
         const ALLOWED_NOTIFICATION_CATEGORIES = new Set(['PRICE_CHANGE', 'EXIT_FIADO', 'ENTRY']);
 
         function sendSystemNotification(title, body, category = 'OTHER') {
@@ -1907,6 +1906,17 @@
             convertUsdToVes();
         }
 
+        async function fetchWithTimeout(url, ms = 5000) {
+            const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+            const timer = controller ? setTimeout(() => controller.abort(), ms) : null;
+            try {
+                const res = await fetch(url, controller ? { signal: controller.signal } : undefined);
+                return res;
+            } finally {
+                if (timer) clearTimeout(timer);
+            }
+        }
+
         async function fetchBcvRates(notify = false) {
             const syncBtn = document.getElementById('btn-sync-bcv');
             if (syncBtn) syncBtn.classList.add('animate-spin');
@@ -1916,16 +1926,16 @@
                 let fetchedNext = 0;
 
                 try {
-                    const res = await fetch('https://ve.dolarapi.com/v1/dolares/oficial');
-                    if (res.ok) {
+                    const res = await fetchWithTimeout('https://ve.dolarapi.com/v1/dolares/oficial');
+                    if (res && res.ok) {
                         const data = await res.json();
                         fetchedToday = Number(data.promedio || data.venta || data.compra) || 0;
                     }
                 } catch (e) {}
 
                 try {
-                    const resHist = await fetch('https://ve.dolarapi.com/v1/historicos/dolares/oficial');
-                    if (resHist.ok) {
+                    const resHist = await fetchWithTimeout('https://ve.dolarapi.com/v1/historicos/dolares/oficial');
+                    if (resHist && resHist.ok) {
                         const histData = await resHist.json();
                         if (Array.isArray(histData) && histData.length > 0) {
                             const todayIso = new Date().toISOString().slice(0, 10);
@@ -1946,8 +1956,8 @@
                 } catch (e) {}
 
                 try {
-                    const res2 = await fetch('https://pydolarve.org/api/v1/dollar?page=bcv');
-                    if (res2.ok) {
+                    const res2 = await fetchWithTimeout('https://pydolarve.org/api/v1/dollar?page=bcv');
+                    if (res2 && res2.ok) {
                         const data2 = await res2.json();
                         const usdMonitor = data2?.monitors?.usd;
                         const price2 = Number(usdMonitor?.price) || 0;
@@ -1979,8 +1989,12 @@
                     bcvState.lastUpdated = getFormattedDateTime();
                     saveBcvState();
                     convertUsdToVes();
+                    if (notify) showToast(`Tasa BCV actualizada: ${formatBs(fetchedToday)}`, 'success');
+                } else if (notify) {
+                    showToast('No se pudo obtener la tasa BCV desde las APIs', 'warning');
                 }
             } catch (err) {
+                if (notify) showToast('Error al consultar la tasa BCV', 'error');
             } finally {
                 if (syncBtn) syncBtn.classList.remove('animate-spin');
             }
@@ -2104,8 +2118,8 @@
 
         function getFormattedDateTime() {
             const now = new Date();
-            return now.toLocaleDateString('es-ES', { day: '2-digit', month: '2-digit', year: 'numeric' }) + 
-                   ' ' + 
+            return now.toLocaleDateString('es-ES', { day: '2-digit', month: '2-digit', year: 'numeric' }) +
+                   ' ' +
                    now.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' });
         }
 
@@ -2391,6 +2405,7 @@
             if (modalPriceCurrency === 'VES' && price > 0) {
                 const rate = getActiveBcvRate();
                 if (rate <= 0) {
+                    showToast('Configura una tasa BCV válida para guardar en Bs.', 'warning');
                     return;
                 }
                 price = Number((price / rate).toFixed(4));
@@ -2463,12 +2478,14 @@
         function confirmDeleteProduct() {
             const id = document.getElementById('delete-modal-product-id').value;
             products = products.filter(item => String(item.id) !== String(id));
+            cart = cart.filter(item => String(item.id) !== String(id));
             if (productPriceViews[id]) delete productPriceViews[id];
             saveData('', 'OTHER');
             closeDeleteModal();
             renderInventoryTable();
             renderEntryList();
             renderExitList();
+            renderCart();
         }
 
         // ================= PRINT / PDF / TXT IMPORT & EXPORT =================
@@ -2480,27 +2497,24 @@
         }
 
         function exportTxtInventory() {
-            let lines = ['=== INVENTARIO ==='];
+            const lines = ['=== INVENTARIO ==='];
             products.forEach(p => {
                 lines.push(`${p.name}: ${p.unitType},${p.stock},${p.price}${p.unitType === 'Paquetes' ? `,${p.unitsPerPack || 1}` : ''}`);
             });
 
-            lines.push('
-=== FIADOS ===');
+            lines.push('', '=== FIADOS ===');
             history.filter(h => h.type === 'FIADO').forEach(f => {
-                const itemsStr = f.items.map(i => `${i.name}|${i.qty}|${i.unitType}|${i.price}`).join(';');
+                const itemsStr = (f.items || []).map(i => `${i.name}|${i.qty}|${i.unitType}|${i.price}`).join(';');
                 lines.push(`${f.clientName || f.detail}|${f.date}|${f.paid ? 'PAGADO' : 'PENDIENTE'}|${f.total}|${itemsStr}`);
             });
 
-            lines.push('
-=== HISTORIAL ===');
+            lines.push('', '=== HISTORIAL ===');
             history.forEach(h => {
-                const itemsStr = h.items.map(i => `${i.name}|${i.qty}|${i.unitType}|${i.price}`).join(';');
+                const itemsStr = (h.items || []).map(i => `${i.name}|${i.qty}|${i.unitType}|${i.price}`).join(';');
                 lines.push(`${h.date}|${h.type}|${h.detail}|${h.total}|${itemsStr}`);
             });
 
-            const blob = new Blob([lines.join('
-')], { type: 'text/plain;charset=utf-8' });
+            const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
@@ -2515,10 +2529,8 @@
 
             const reader = new FileReader();
             reader.onload = function(e) {
-                const content = e.target.result;
-                const rawLines = content.split(/
-?
-/);
+                const content = String(e.target.result || '');
+                const rawLines = content.split(/\r?\n/);
                 let currentSection = 'INVENTARIO';
 
                 rawLines.forEach(rawLine => {
@@ -2548,6 +2560,7 @@
                                 if (existingIdx !== -1) {
                                     products[existingIdx].unitType = unitType;
                                     products[existingIdx].stock = stock;
+                                    products[existingIdx].unlimitedStock = (unitType === 'Kg' && stock === 999);
                                     if (price > 0) products[existingIdx].price = price;
                                     products[existingIdx].unitsPerPack = unitsPerPack;
                                 } else {
@@ -2556,10 +2569,36 @@
                                         name,
                                         unitType,
                                         stock,
+                                        unlimitedStock: (unitType === 'Kg' && stock === 999),
                                         price,
                                         unitsPerPack
                                     });
                                 }
+                            }
+                        }
+                    } else if (currentSection === 'FIADOS') {
+                        const cols = line.split('|');
+                        if (cols.length >= 4) {
+                            const [clientName, date, statusStr, totalStr, itemsRaw] = cols;
+                            const isPaid = String(statusStr).toUpperCase() === 'PAGADO';
+                            const total = parseFloat(totalStr) || 0;
+                            const items = (itemsRaw || '').split(';').filter(Boolean).map(it => {
+                                const [iName, iQty, iUnit, iPrice] = it.split('|');
+                                return { name: iName, qty: parseFloat(iQty) || 0, unitType: iUnit || 'Unidades', price: parseFloat(iPrice) || 0 };
+                            });
+                            const exists = history.some(h => h.type === 'FIADO' && h.date === date && (h.clientName || '') === clientName && Math.abs((Number(h.total) || 0) - total) < 0.001);
+                            if (!exists) {
+                                history.push({
+                                    id: generateId(),
+                                    date,
+                                    type: 'FIADO',
+                                    clientName,
+                                    detail: `Cliente: ${clientName}`,
+                                    total,
+                                    items,
+                                    paid: isPaid,
+                                    paidDate: isPaid ? date : null
+                                });
                             }
                         }
                     } else if (currentSection === 'HISTORIAL') {
@@ -2570,15 +2609,20 @@
                                 const [iName, iQty, iUnit, iPrice] = it.split('|');
                                 return { name: iName, qty: parseFloat(iQty) || 0, unitType: iUnit || 'Unidades', price: parseFloat(iPrice) || 0 };
                             });
-                            history.push({
-                                id: generateId(),
-                                date,
-                                type,
-                                detail,
-                                total: parseFloat(totalStr) || 0,
-                                items,
-                                paid: type === 'FIADO' ? false : true
-                            });
+                            const total = parseFloat(totalStr) || 0;
+                            const exists = history.some(h => h.date === date && h.type === type && h.detail === detail && Math.abs((Number(h.total) || 0) - total) < 0.001);
+                            if (!exists) {
+                                history.push({
+                                    id: generateId(),
+                                    date,
+                                    type,
+                                    clientName: type === 'FIADO' ? detail.replace(/^Cliente:\s*/i, '') : '',
+                                    detail,
+                                    total,
+                                    items,
+                                    paid: type === 'FIADO' ? false : true
+                                });
+                            }
                         }
                     }
                 });
@@ -2587,9 +2631,11 @@
                 renderInventoryTable();
                 renderEntryList();
                 renderExitList();
+                renderPriceAdjustList();
                 renderFiados();
                 renderEarnings();
                 renderHistory();
+                showToast('Archivo TXT importado correctamente', 'success');
                 event.target.value = '';
             };
             reader.readAsText(file);
@@ -2664,6 +2710,7 @@
                         if (existingIndex !== -1) {
                             products[existingIndex].stock = stock;
                             products[existingIndex].unitType = unitType;
+                            products[existingIndex].unlimitedStock = (unitType === 'Kg' && stock === 999);
                             if (price > 0) products[existingIndex].price = price;
                             updatedCount++;
                         } else {
@@ -2673,6 +2720,7 @@
                                 unitType,
                                 price,
                                 stock,
+                                unlimitedStock: (unitType === 'Kg' && stock === 999),
                                 unitsPerPack: 1
                             });
                             addedCount++;
@@ -2693,6 +2741,7 @@
                     renderInventoryTable();
                     renderEntryList();
                     renderExitList();
+                    renderPriceAdjustList();
                 }
             } catch (err) {
                 console.error(err);
@@ -2926,6 +2975,7 @@
             const currentCartQty = existingInCart ? existingInCart.qty : 0;
 
             if (!isUnlimitedKg(p) && qty + currentCartQty > p.stock + 0.0001) {
+                showToast('Cantidad superior al stock disponible', 'warning');
                 return;
             }
 
@@ -3034,12 +3084,14 @@
             const clientName = document.getElementById('cart-client-name').value.trim();
             if (transactionType === 'FIADO' && !clientName) {
                 document.getElementById('cart-client-name').focus();
+                showToast('Ingresa el nombre del cliente para el fiado', 'warning');
                 return;
             }
 
             for (const item of cart) {
                 const prod = products.find(p => String(p.id) === String(item.id));
                 if (!prod || (!isUnlimitedKg(prod) && prod.stock < item.qty)) {
+                    showToast(`Stock insuficiente para ${item.name}`, 'error');
                     return;
                 }
             }
@@ -3054,6 +3106,9 @@
                 grandTotal += item.qty * item.price;
             });
 
+            const rate = getActiveBcvRate();
+            const bsNote = (cartCurrency === 'VES' && rate > 0) ? ` [${formatBs(grandTotal * rate)} @ ${rate.toFixed(2)}]` : '';
+
             history.unshift({
                 id: generateId(),
                 date: getFormattedDateTime(),
@@ -3061,7 +3116,7 @@
                 clientName: transactionType === 'FIADO' ? clientName : '',
                 paid: transactionType === 'FIADO' ? false : true,
                 paidDate: null,
-                detail: transactionType === 'FIADO' ? `Cliente: ${clientName}` : 'Venta al contado',
+                detail: (transactionType === 'FIADO' ? `Cliente: ${clientName}` : 'Venta al contado') + bsNote,
                 items: [...cart],
                 total: grandTotal
             });
@@ -3265,7 +3320,7 @@
 
             tbody.innerHTML = fiadosList.map(f => {
                 const clientDisplay = f.clientName || f.detail.replace(/^Cliente:\s*/i, '');
-                const itemsSummary = f.items.map(i => `${formatNumber(i.qty)} ${i.unitType} de ${i.name}`).join(', ');
+                const itemsSummary = (f.items || []).map(i => `${formatNumber(i.qty)} ${i.unitType} de ${i.name}`).join(', ');
                 const isPaid = Boolean(f.paid);
 
                 return `
@@ -3442,7 +3497,7 @@
                         const badgeClass = isCreditPending
                             ? 'bg-amber-50 text-amber-700 border border-amber-200'
                             : 'bg-emerald-50 text-emerald-700 border border-emerald-200';
-                        const itemsSummary = tx.items.map(i => `${formatNumber(i.qty)} ${i.unitType} de ${i.name}`).join(', ');
+                        const itemsSummary = (tx.items || []).map(i => `${formatNumber(i.qty)} ${i.unitType} de ${i.name}`).join(', ');
 
                         return `
                             <tr class="hover:bg-slate-50/80 transition-colors">
@@ -3490,7 +3545,7 @@
                 if (h.type === 'VENTA') badgeStyle = 'bg-indigo-50 text-indigo-700 border border-indigo-200';
                 if (h.type === 'FIADO') badgeStyle = 'bg-amber-50 text-amber-700 border border-amber-200';
 
-                const itemsSummary = h.items.map(i => `${formatNumber(i.qty)} ${i.unitType} de ${i.name}`).join(', ');
+                const itemsSummary = (h.items || []).map(i => `${formatNumber(i.qty)} ${i.unitType} de ${i.name}`).join(', ');
 
                 return `
                     <tr class="hover:bg-slate-50/80 transition-colors">
@@ -3511,7 +3566,7 @@
         }
 
         // ================= INITIALIZATION =================
-        window.onload = function() {
+        window.addEventListener('DOMContentLoaded', function() {
             initGlobalPageBus();
             lucide.createIcons();
             syncBcvUi();
@@ -3524,7 +3579,7 @@
             if (savedSession && savedSession.username) {
                 startUserSession(savedSession.username, savedSession.syncRoom || savedSession.username);
             }
-        };
+        });
     </script>
 </body>
 </html>
