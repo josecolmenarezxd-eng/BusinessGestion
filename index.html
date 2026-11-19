@@ -933,7 +933,7 @@
                 else if (section === 'exit') renderExitList();
                 else if (section === 'prices') renderPriceAdjustList();
                 else if (section === 'fiados') renderFiados();
-            }, 90);
+            }, 140);
         }
 
         // ================= STATE MANAGEMENT, AUTH & ISOLATED ACCOUNT STORAGE =================
@@ -1181,14 +1181,12 @@
                     if (msg.initialPayload) {
                         SafeStorage.set(`gp_account_data_${msg.user.username}`, msg.initialPayload);
                     }
-                    showToast(`Cuenta "${msg.user.username}" detectada desde otro dispositivo/pestaña.`);
                 }
 
                 if (msg.type === 'SESSION_EVENT' && currentUser && msg.username === currentUser) {
                     if (msg.action === 'LOGGED_OUT') {
-                        // Guardar datos locales y refrescar estado de nube sin borrar datos de la cuenta
                         if (msg.latestPayload && Number(msg.latestPayload.revision) > Number(lastSyncedRevision)) {
-                            applyIncomingAccountSync(msg.latestPayload, 'Datos guardados al cerrar sesión en otro dispositivo');
+                            applyIncomingAccountSync(msg.latestPayload, '');
                         }
                     }
                 }
@@ -1270,7 +1268,6 @@
                 try {
                     await publishAccountOnce(record);
                     clearPendingAccountQueue(uname);
-                    showToast(`Cuenta "${uname}" sincronizada con la nube.`);
                 } catch (e) {}
             }
         }
@@ -1372,13 +1369,7 @@
                 statusEl.innerText = published ? '¡Cuenta guardada en la nube! Entrando...' : 'Entrando en modo local...';
                 startUserSession(rawUser, rawUser);
                 lastSyncedRevision = initialRev;
-                await pushRemoteCloudSync(initialPayload, 'Cuenta creada y sincronizada');
-                showToast(
-                    published
-                        ? `¡Cuenta "${rawUser}" creada y disponible en todos tus dispositivos!`
-                        : `Cuenta "${rawUser}" creada localmente. Configura Firebase para entrar desde otros dispositivos.`,
-                    published ? 'success' : 'warning'
-                );
+                await pushRemoteCloudSync(initialPayload, 'ACCOUNT_CREATED', 'Cuenta creada y sincronizada');
             } finally {
                 isPublishingAccount = false;
                 submitBtn.disabled = false;
@@ -1418,7 +1409,6 @@
 
                 startUserSession(rawUser, rawUser);
                 await pullRemoteCloudSync(false);
-                showToast(`Bienvenido de nuevo, ${rawUser}.`);
             } finally {
                 submitBtn.disabled = false;
             }
@@ -1481,6 +1471,7 @@
                     try {
                         await cloudDb.ref(`inventories/${safeUser}`).set({
                             sourceDevice: deviceId,
+                            eventCategory: 'OTHER',
                             changeSummary: 'Datos guardados al cerrar sesión',
                             payload: currentPayload
                         });
@@ -1540,12 +1531,44 @@
             }
         }
 
-        function sendSystemNotification(title, body) {
+        // Solo notificar cuando el evento sea PRICE_CHANGE, EXIT_FIADO o ENTRY
+        const ALLOWED_NOTIFICATION_CATEGORIES = new Set(['PRICE_CHANGE', 'EXIT_FIADO', 'ENTRY']);
+
+        function sendSystemNotification(title, body, category = 'OTHER') {
+            if (!ALLOWED_NOTIFICATION_CATEGORIES.has(category)) return;
             if ('Notification' in window && Notification.permission === 'granted') {
                 try {
                     new Notification(title, { body });
                 } catch (e) {}
             }
+        }
+
+        function detectRelevantChangeCategory(oldProducts, newProducts, oldHistory, newHistory, explicitCategory) {
+            if (explicitCategory && ALLOWED_NOTIFICATION_CATEGORIES.has(explicitCategory)) {
+                return explicitCategory;
+            }
+            const prevHist = Array.isArray(oldHistory) ? oldHistory : [];
+            const nextHist = Array.isArray(newHistory) ? newHistory : [];
+            if (nextHist.length > prevHist.length) {
+                const newest = nextHist[0];
+                if (newest && (newest.type === 'VENTA' || newest.type === 'FIADO')) {
+                    return 'EXIT_FIADO';
+                }
+                if (newest && newest.type === 'ENTRADA') {
+                    return 'ENTRY';
+                }
+            }
+            const prevProds = Array.isArray(oldProducts) ? oldProducts : [];
+            const nextProds = Array.isArray(newProducts) ? newProducts : [];
+            const prevPriceMap = new Map(prevProds.map(p => [String(p.id), Number(p.price) || 0]));
+            for (const np of nextProds) {
+                const oldP = prevPriceMap.get(String(np.id));
+                const newP = Number(np.price) || 0;
+                if (oldP !== undefined && Math.abs(oldP - newP) > 1e-6) {
+                    return 'PRICE_CHANGE';
+                }
+            }
+            return 'OTHER';
         }
 
         // ================= REAL-TIME MULTI-DEVICE SYNC (FIREBASE WEBSOCKETS) =================
@@ -1556,7 +1579,7 @@
                 syncChannel.onmessage = (event) => {
                     const msg = event.data;
                     if (msg && msg.type === 'ACCOUNT_UPDATED' && msg.sourceDevice !== deviceId) {
-                        applyIncomingAccountSync(msg.payload, msg.changeSummary || 'Cambio detectado en otra pestaña');
+                        applyIncomingAccountSync(msg.payload, msg.changeSummary || '', msg.eventCategory || 'OTHER');
                     }
                 };
             }
@@ -1584,7 +1607,8 @@
                     ) {
                         applyIncomingAccountSync(
                             msgData.payload,
-                            msgData.changeSummary || 'Actualización remota recibida'
+                            msgData.changeSummary || '',
+                            msgData.eventCategory || 'OTHER'
                         );
                     }
                 });
@@ -1593,27 +1617,25 @@
                 activeSessionListener.on('child_changed', (snapshot) => {
                     const sess = snapshot.val();
                     if (sess && sess.deviceId !== deviceId && sess.status === 'LOGGED_OUT') {
-                        pullRemoteCloudSync(true);
+                        pullRemoteCloudSync(false);
                     }
                 });
             }
         }
 
-        async function pushRemoteCloudSync(payload, changeSummary) {
+        async function pushRemoteCloudSync(payload, eventCategory = 'OTHER', changeSummary = '') {
             if (!currentUser) return;
             if (!cloudDb || !navigator.onLine) {
                 pendingOfflineSync = true;
                 updateCloudStatusIndicators();
-                if (!navigator.onLine) {
-                    sendSystemNotification('GestiónPro (Modo Offline)', `Cambio guardado localmente: ${changeSummary}. Se sincronizará al volver internet.`);
-                }
                 return;
             }
             try {
                 const safeUser = sanitizeCloudKey(currentUser);
                 await cloudDb.ref(`inventories/${safeUser}`).set({
                     sourceDevice: deviceId,
-                    changeSummary: changeSummary || 'Actualización',
+                    eventCategory: eventCategory || 'OTHER',
+                    changeSummary: changeSummary || '',
                     payload: payload
                 });
                 pendingOfflineSync = false;
@@ -1639,7 +1661,8 @@
                     ) {
                         applyIncomingAccountSync(
                             msgData.payload,
-                            announce ? (msgData.changeSummary || 'Actualización remota recibida') : 'Datos sincronizados desde la nube'
+                            announce ? (msgData.changeSummary || '') : '',
+                            announce ? (msgData.eventCategory || 'OTHER') : 'OTHER'
                         );
                     }
                 }
@@ -1648,8 +1671,11 @@
             }
         }
 
-        function applyIncomingAccountSync(payload, summaryText) {
+        function applyIncomingAccountSync(payload, summaryText, eventCategory = 'OTHER') {
             if (!payload || Number(payload.revision) <= Number(lastSyncedRevision)) return;
+            const prevProducts = products;
+            const prevHistory = history;
+
             products = Array.isArray(payload.products) ? payload.products : [];
             history = Array.isArray(payload.history) ? payload.history : [];
             productPriceViews = payload.productPriceViews || {};
@@ -1670,9 +1696,10 @@
             renderEarnings();
             renderHistory();
 
-            if (summaryText) {
-                showToast(`Sincronizado: ${summaryText}`, 'warning');
-                sendSystemNotification(`Inventario (${currentUser}) actualizado`, summaryText);
+            const detectedCat = detectRelevantChangeCategory(prevProducts, products, prevHistory, history, eventCategory);
+            if (ALLOWED_NOTIFICATION_CATEGORIES.has(detectedCat) && summaryText) {
+                showToast(summaryText, detectedCat === 'PRICE_CHANGE' ? 'warning' : 'success');
+                sendSystemNotification(`GestiónPro (${currentUser})`, summaryText, detectedCat);
             }
         }
 
@@ -1699,30 +1726,27 @@
             if (currentUser) {
                 if (pendingOfflineSync) {
                     const currentPayload = SafeStorage.get(getAccountStorageKey());
-                    if (currentPayload) pushRemoteCloudSync(currentPayload, 'Cambios offline sincronizados');
+                    if (currentPayload) pushRemoteCloudSync(currentPayload, 'OTHER', '');
                 }
-                pullRemoteCloudSync(true);
-                showToast('Conexión restaurada. Inventario sincronizado.');
-                sendSystemNotification('GestiónPro Conectado', 'Tu inventario está sincronizado con tus dispositivos.');
+                pullRemoteCloudSync(false);
             }
         });
 
         window.addEventListener('offline', () => {
             updateConnectionBadge();
-            showToast('Sin internet: modo offline activo. Los cambios se guardan y se enviarán al reconectar.', 'warning');
-            sendSystemNotification('GestiónPro Offline', 'Sin conexión. Tus cambios se guardarán localmente.');
+            updateCloudStatusIndicators();
         });
 
         window.addEventListener('storage', (e) => {
             if (currentUser && e.key === getAccountStorageKey() && e.newValue) {
                 try {
                     const parsed = JSON.parse(e.newValue);
-                    applyIncomingAccountSync(parsed, 'Cambio detectado en otra ventana');
+                    applyIncomingAccountSync(parsed, '', 'OTHER');
                 } catch (err) {}
             }
         });
 
-        function saveData(changeSummary = 'Inventario actualizado') {
+        function saveData(changeSummary = '', eventCategory = 'OTHER') {
             if (!currentUser) return;
             const newRevision = Math.max(Date.now(), Number(lastSyncedRevision) + 1);
             lastSyncedRevision = newRevision;
@@ -1739,11 +1763,12 @@
                 syncChannel.postMessage({
                     type: 'ACCOUNT_UPDATED',
                     sourceDevice: deviceId,
+                    eventCategory,
                     changeSummary,
                     payload
                 });
             }
-            pushRemoteCloudSync(payload, changeSummary);
+            pushRemoteCloudSync(payload, eventCategory, changeSummary);
         }
 
         function generateId() {
@@ -1766,7 +1791,7 @@
         function toggleProductPriceCurrency(productId) {
             const current = productPriceViews[productId] || 'USD';
             productPriceViews[productId] = current === 'USD' ? 'VES' : 'USD';
-            saveData('Cambio de moneda en precio');
+            saveData('', 'OTHER');
             renderInventoryTable();
             renderExitList();
         }
@@ -1774,9 +1799,7 @@
         // ================= FULLSCREEN TOGGLE =================
         function toggleFullScreen() {
             if (!document.fullscreenElement) {
-                document.documentElement.requestFullscreen().catch(() => {
-                    showToast('Tu navegador bloqueó la pantalla completa automática.', 'warning');
-                });
+                document.documentElement.requestFullscreen().catch(() => {});
             } else if (document.exitFullscreen) {
                 document.exitFullscreen();
             }
@@ -1866,9 +1889,6 @@
 
         function setBcvDayMode(mode) {
             bcvState.mode = mode;
-            if (mode === 'TOMORROW' && (!bcvState.tomorrowRate || bcvState.tomorrowRate === bcvState.todayRate)) {
-                showToast('Mostrando tasa siguiente (puedes editarla manualmente si aún no publica el BCV).', 'warning');
-            }
             saveBcvState();
             convertUsdToVes();
         }
@@ -1885,7 +1905,6 @@
             bcvState.lastUpdated = 'Manual ' + getFormattedDateTime();
             saveBcvState();
             convertUsdToVes();
-            showToast(`Tasa BCV (${bcvState.mode === 'TOMORROW' ? 'Mañana' : 'Hoy'}) actualizada a ${formatBs(parsed)}.`);
         }
 
         async function fetchBcvRates(notify = false) {
@@ -1960,18 +1979,8 @@
                     bcvState.lastUpdated = getFormattedDateTime();
                     saveBcvState();
                     convertUsdToVes();
-
-                    if (notify) {
-                        const nextDiffMsg = bcvState.tomorrowRate !== bcvState.todayRate
-                            ? ` | Mañana: ${formatBs(bcvState.tomorrowRate)}`
-                            : ' (Mañana aún sin cambio publicado)';
-                        showToast(`BCV Hoy: ${formatBs(bcvState.todayRate)}${nextDiffMsg}`);
-                    }
-                } else if (notify) {
-                    showToast('No se pudo conectar con la API del BCV. Puedes escribir la tasa manualmente.', 'warning');
                 }
             } catch (err) {
-                if (notify) showToast('Error al consultar API BCV. Ingresa el monto manualmente.', 'error');
             } finally {
                 if (syncBtn) syncBtn.classList.remove('animate-spin');
             }
@@ -2102,6 +2111,7 @@
 
         // ================= TOAST NOTIFICATIONS =================
         function showToast(message, type = 'success') {
+            if (!message) return;
             const container = document.getElementById('toast-container');
             const toast = document.createElement('div');
             const bgColor = type === 'error' ? 'bg-rose-600' : (type === 'warning' ? 'bg-amber-600' : 'bg-emerald-600');
@@ -2381,7 +2391,6 @@
             if (modalPriceCurrency === 'VES' && price > 0) {
                 const rate = getActiveBcvRate();
                 if (rate <= 0) {
-                    showToast('Ingresa una tasa BCV válida para convertir desde Bolívares.', 'warning');
                     return;
                 }
                 price = Number((price / rate).toFixed(4));
@@ -2397,8 +2406,13 @@
             if (id) {
                 const index = products.findIndex(p => String(p.id) === String(id));
                 if (index !== -1) {
+                    const prevPrice = Number(products[index].price) || 0;
+                    const priceChanged = Math.abs(prevPrice - price) > 1e-6;
                     products[index] = { ...products[index], name, unitType, price, stock, unitsPerPack, unlimitedStock };
-                    showToast(`Producto "${name}" actualizado.`);
+                    saveData(
+                        priceChanged ? `Precio modificado en "${name}": ${formatCurrency(price)}` : '',
+                        priceChanged ? 'PRICE_CHANGE' : 'OTHER'
+                    );
                 }
             } else {
                 const newProd = {
@@ -2421,11 +2435,12 @@
                         items: [{ name, qty: unlimitedStock ? 0 : stock, unitType: unitType === 'Paquetes' ? 'Unidades' : unitType, price }],
                         total: unlimitedStock ? 0 : (stock * price)
                     });
+                    saveData(`Llegada de ${name}`, 'ENTRY');
+                } else {
+                    saveData('', 'OTHER');
                 }
-                showToast(`Producto "${name}" agregado al inventario.`);
             }
 
-            saveData(`Producto ${id ? 'editado' : 'creado'}: ${name}`);
             closeProductModal();
             renderInventoryTable();
             renderEntryList();
@@ -2447,15 +2462,13 @@
 
         function confirmDeleteProduct() {
             const id = document.getElementById('delete-modal-product-id').value;
-            const p = products.find(item => String(item.id) === String(id));
             products = products.filter(item => String(item.id) !== String(id));
             if (productPriceViews[id]) delete productPriceViews[id];
-            saveData(p ? `Eliminado "${p.name}"` : 'Producto eliminado');
+            saveData('', 'OTHER');
             closeDeleteModal();
             renderInventoryTable();
             renderEntryList();
             renderExitList();
-            showToast(p ? `"${p.name}" eliminado del inventario.` : 'Producto eliminado.', 'warning');
         }
 
         // ================= PRINT / PDF / TXT IMPORT & EXPORT =================
@@ -2472,26 +2485,28 @@
                 lines.push(`${p.name}: ${p.unitType},${p.stock},${p.price}${p.unitType === 'Paquetes' ? `,${p.unitsPerPack || 1}` : ''}`);
             });
 
-            lines.push('\n=== FIADOS ===');
+            lines.push('
+=== FIADOS ===');
             history.filter(h => h.type === 'FIADO').forEach(f => {
                 const itemsStr = f.items.map(i => `${i.name}|${i.qty}|${i.unitType}|${i.price}`).join(';');
                 lines.push(`${f.clientName || f.detail}|${f.date}|${f.paid ? 'PAGADO' : 'PENDIENTE'}|${f.total}|${itemsStr}`);
             });
 
-            lines.push('\n=== HISTORIAL ===');
+            lines.push('
+=== HISTORIAL ===');
             history.forEach(h => {
                 const itemsStr = h.items.map(i => `${i.name}|${i.qty}|${i.unitType}|${i.price}`).join(';');
                 lines.push(`${h.date}|${h.type}|${h.detail}|${h.total}|${itemsStr}`);
             });
 
-            const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' });
+            const blob = new Blob([lines.join('
+')], { type: 'text/plain;charset=utf-8' });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
             a.download = `respaldo_inventario_${new Date().toISOString().slice(0, 10)}.txt`;
             a.click();
             URL.revokeObjectURL(url);
-            showToast('Archivo TXT descargado correctamente.');
         }
 
         function handleTxtUpload(event) {
@@ -2501,10 +2516,10 @@
             const reader = new FileReader();
             reader.onload = function(e) {
                 const content = e.target.result;
-                const rawLines = content.split(/\r?\n/);
+                const rawLines = content.split(/
+?
+/);
                 let currentSection = 'INVENTARIO';
-                let addedCount = 0;
-                let updatedCount = 0;
 
                 rawLines.forEach(rawLine => {
                     const line = rawLine.trim();
@@ -2535,7 +2550,6 @@
                                     products[existingIdx].stock = stock;
                                     if (price > 0) products[existingIdx].price = price;
                                     products[existingIdx].unitsPerPack = unitsPerPack;
-                                    updatedCount++;
                                 } else {
                                     products.push({
                                         id: generateId(),
@@ -2545,7 +2559,6 @@
                                         price,
                                         unitsPerPack
                                     });
-                                    addedCount++;
                                 }
                             }
                         }
@@ -2570,14 +2583,13 @@
                     }
                 });
 
-                saveData('Importación desde TXT');
+                saveData('', 'OTHER');
                 renderInventoryTable();
                 renderEntryList();
                 renderExitList();
                 renderFiados();
                 renderEarnings();
                 renderHistory();
-                showToast(`TXT importado: ${addedCount} nuevos, ${updatedCount} actualizados.`);
                 event.target.value = '';
             };
             reader.readAsText(file);
@@ -2589,12 +2601,10 @@
 
             try {
                 if (typeof pdfjsLib === 'undefined') {
-                    showToast('La librería lectora de PDF aún está cargando. Intenta de nuevo en unos segundos.', 'warning');
                     return;
                 }
 
                 pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-                showToast('Leyendo archivo PDF...', 'warning');
 
                 const arrayBuffer = await file.arrayBuffer();
                 const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
@@ -2679,17 +2689,13 @@
                         items: [{ name: 'Actualización masiva PDF', qty: addedCount + updatedCount, unitType: 'Unidades', price: 0 }],
                         total: 0
                     });
-                    saveData('Importación desde PDF');
+                    saveData(`Llegada por PDF (${addedCount + updatedCount} items)`, 'ENTRY');
                     renderInventoryTable();
                     renderEntryList();
                     renderExitList();
-                    showToast(`PDF procesado: ${addedCount} agregados y ${updatedCount} actualizados.`);
-                } else {
-                    showToast('No se detectaron filas de inventario válidas en este PDF.', 'error');
                 }
             } catch (err) {
                 console.error(err);
-                showToast('Error al leer el archivo PDF. Asegúrate de subir un reporte válido.', 'error');
             } finally {
                 event.target.value = '';
             }
@@ -2800,10 +2806,9 @@
                 total: addedUnits * p.price
             });
 
-            saveData(`Llegada de ${p.name}`);
+            saveData(`Llegada: +${formatNumber(addedUnits)} ${isPackage ? 'Unidades' : p.unitType} de ${p.name}`, 'ENTRY');
             renderEntryList();
             selectProductForEntry(id);
-            showToast(`+${formatNumber(addedUnits)} ${isPackage ? 'Unidades' : p.unitType} sumados a "${p.name}".`);
         }
 
         // ================= EXIT / SALE / FIADO LOGIC =================
@@ -2907,13 +2912,11 @@
             const p = products.find(item => String(item.id) === String(id));
 
             if (!p) {
-                showToast('Error al encontrar el producto.', 'error');
                 closeQtyModal();
                 return;
             }
 
             if (isNaN(qty) || qty <= 0) {
-                showToast('Ingresa una cantidad válida mayor a 0.', 'warning');
                 document.getElementById('qty-modal-input').focus();
                 return;
             }
@@ -2923,7 +2926,6 @@
             const currentCartQty = existingInCart ? existingInCart.qty : 0;
 
             if (!isUnlimitedKg(p) && qty + currentCartQty > p.stock + 0.0001) {
-                showToast(`Stock insuficiente. Máximo disponible: ${formatNumber(p.stock - currentCartQty)} ${displayUnit}`, 'error');
                 return;
             }
 
@@ -2941,7 +2943,6 @@
 
             closeQtyModal();
             renderCart();
-            showToast(`Agregado a la factura.`);
         }
 
         function removeFromCart(id) {
@@ -3032,7 +3033,6 @@
 
             const clientName = document.getElementById('cart-client-name').value.trim();
             if (transactionType === 'FIADO' && !clientName) {
-                showToast('Por favor ingresa el nombre del cliente para el fiado.', 'warning');
                 document.getElementById('cart-client-name').focus();
                 return;
             }
@@ -3040,7 +3040,6 @@
             for (const item of cart) {
                 const prod = products.find(p => String(p.id) === String(item.id));
                 if (!prod || (!isUnlimitedKg(prod) && prod.stock < item.qty)) {
-                    showToast(`Stock insuficiente para "${item.name}".`, 'error');
                     return;
                 }
             }
@@ -3069,10 +3068,14 @@
 
             cart = [];
             document.getElementById('cart-client-name').value = '';
-            saveData(transactionType === 'FIADO' ? `Fiado a ${clientName}` : 'Venta registrada');
+            saveData(
+                transactionType === 'FIADO'
+                    ? `Fiado a ${clientName} (${formatCurrency(grandTotal)})`
+                    : `Venta registrada (${formatCurrency(grandTotal)})`,
+                'EXIT_FIADO'
+            );
             renderCart();
             renderExitList();
-            showToast(transactionType === 'FIADO' ? 'Fiado registrado y descontado del stock.' : 'Venta completada con éxito.');
         }
 
         // ================= PRICE ADJUSTMENT SECTION LOGIC =================
@@ -3207,7 +3210,6 @@
             const index = products.findIndex(p => String(p.id) === String(id));
 
             if (index === -1 || isNaN(val) || val <= 0) {
-                showToast('Ingresa un valor válido mayor a 0.', 'warning');
                 return;
             }
 
@@ -3215,15 +3217,11 @@
             const newPrice = computeAdjustedPrice(oldPrice, val);
             products[index].price = newPrice;
 
-            saveData(`Precio ajustado: ${products[index].name}`);
+            saveData(`Precio de "${products[index].name}" cambió a ${formatCurrency(newPrice)}`, 'PRICE_CHANGE');
             renderPriceAdjustList();
             selectProductForPriceAdjust(id);
             renderInventoryTable();
             renderExitList();
-
-            const opSymbol = priceAdjustOp === 'INC' ? '+' : '-';
-            const valLabel = priceAdjustMode === 'PERCENT' ? `${val}%` : formatCurrency(val);
-            showToast(`Precio de "${products[index].name}" actualizado (${opSymbol}${valLabel} → ${formatCurrency(newPrice)}).`);
         }
 
         // ================= FIADOS (ACCOUNTS RECEIVABLE) LOGIC =================
@@ -3233,10 +3231,9 @@
 
             record.paid = !record.paid;
             record.paidDate = record.paid ? getFormattedDateTime() : null;
-            saveData(record.paid ? `Fiado cobrado` : `Fiado marcado pendiente`);
+            saveData('', 'OTHER');
             renderFiados();
             renderEarnings();
-            showToast(record.paid ? '¡Fiado marcado como PAGADO!' : 'Fiado marcado como PENDIENTE.', record.paid ? 'success' : 'warning');
         }
 
         function renderFiados() {
@@ -3515,10 +3512,12 @@
 
         // ================= INITIALIZATION =================
         window.onload = function() {
+            initGlobalPageBus();
             lucide.createIcons();
             syncBcvUi();
             fetchBcvRates(false);
             updateConnectionBadge();
+            updateCloudStatusIndicators();
             flushPendingAccountPublishes();
 
             const savedSession = SafeStorage.get('gp_active_session');
